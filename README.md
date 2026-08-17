@@ -42,6 +42,10 @@ pnpm build
 - 代理依赖 `NODE_USE_ENV_PROXY=1`（进程启动时注入，由哨卫 watch 负责）
 - 时间敏感：offset 至少一次语义 + pending 持久化保证「重启窗口不丢消息」
 
+## 相关
+
+- [我的数字生命爱丽丝 — 插件生态中心（架构总览）](https://github.com/jonah791/alice-digital-life)
+
 ## License
 
 MIT
