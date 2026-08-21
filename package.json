@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-telegram",
-  "version": "0.1.0",
-  "description": "Telegram 远程连接：八千代 bot 长轮询接收主人消息 → 注入主会话 → 回复回传 Telegram（白名单绑定，串行 pending）",
+  "version": "0.2.0",
+  "description": "Telegram 一体化插件：inbound（长轮询收消息注入主会话+回复回传）+ outbound（telegram_send/status 可靠推送+outbox 防丢失）合并单插件",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -32,8 +32,5 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
-  },
-  "dependencies": {
-    "undici": "^8.10.0"
   }
 }
