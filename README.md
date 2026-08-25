@@ -1,3 +1,13 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: Telegram 一体化插件：inbound（长轮询收消息注入主会话+回复回传）+ outbound（telegram_send/status 可靠推送+outbox 防丢失）合并单插件
+  inject: 'agents','sessions','tools'
+  tools: telegram_send,telegram_status
+  runtime: host-only
+  envDeps: 无（纯逻辑/标准 Node）
+  boundary: 无特殊授权边界
+  compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
+-->
 # dsh-agent-telegram — Telegram 远程连接插件
 
 DSH（DeepSeek Harness）插件：通过 Telegram Bot 远程连接主会话——随时随地向 agent 发消息、接收实时回复与任务直播。

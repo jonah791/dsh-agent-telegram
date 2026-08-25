@@ -353,6 +353,43 @@ export function apply(ctx: Context, config: Config): void {
       void sendText(chatId, 'pong ' + new Date().toISOString())
       return
     }
+    if (trimmed === '/sessions') {
+      const lines = ctx.sessions.list().map((s) => {
+        const dep = s.header?.delegationDepth ?? 0
+        return (dep === 0 ? '*' : ' ') + s.id + ' ev=' + s.events.length
+      })
+      void sendText(chatId, '会话列表 (' + lines.length + '，*主会话):\n' + (lines.join('\n') || '（空）'))
+      return
+    }
+    if (trimmed === '/context') {
+      const targetId = resolveTargetSessionId()
+      const s = targetId !== null ? ctx.sessions.list().find((x) => x.id === targetId) : undefined
+      if (s === undefined) { void sendText(chatId, '无活跃会话'); return }
+      const events = s.events
+      const last = events.length > 0 ? new Date(events[events.length - 1]?.time ?? 0).toISOString() : '-'
+      const msgCount = events.filter((e) => (e as { type?: string }).type === 'user/message' || (e as { type?: string }).type === 'assistant/message').length
+      void sendText(chatId, '上下文 ' + targetId + '\nevents=' + events.length + ' msgs=' + msgCount + '\nlast=' + last)
+      return
+    }
+    if (trimmed.startsWith('/content')) {
+      const n = Number(trimmed.split(/\s+/)[1] ?? '3')
+      const k = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 20) : 3
+      const targetId = resolveTargetSessionId()
+      const s = targetId !== null ? ctx.sessions.list().find((x) => x.id === targetId) : undefined
+      if (s === undefined) { void sendText(chatId, '无活跃会话'); return }
+      const msgs: string[] = []
+      for (const ev of s.events) {
+        const type = (ev as { type?: string }).type
+        if (type !== 'user/message' && type !== 'assistant/message') continue
+        const msg = (ev as { data?: { message?: Message } }).data?.message
+        const text = summarizeBlocks(msg).trim().slice(0, 300)
+        if (text.length === 0) continue
+        msgs.push((type === 'user/message' ? '[用户] ' : '[爱丽丝] ') + text)
+      }
+      const tail = msgs.slice(-k)
+      void sendText(chatId, '最近 ' + tail.length + ' 条消息:\n' + (tail.join('\n---\n') || '（无文本消息）'))
+      return
+    }
 
     const targetId = resolveTargetSessionId()
     if (targetId === null) {
@@ -446,6 +483,9 @@ export function apply(ctx: Context, config: Config): void {
       '八千代 Telegram 远程\n' +
       '/status 状态\n' +
       '/ping 心跳\n' +
+      '/sessions 会话列表\n' +
+      '/context 上下文压力（events/消息数）\n' +
+      '/content [n] 最近 n 条消息摘要（默认 3）\n' +
       '其他消息 → 注入主会话（空闲=正常对话；忙碌=实时干预）'
     )
   }
