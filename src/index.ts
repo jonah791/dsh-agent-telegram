@@ -28,9 +28,9 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent' // Context.agents / session 事件类型 merge
 import type {} from '@deepseek-ai/dsh-session'
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 export const name = 'agent-telegram'
 export const inject = ['agents', 'sessions', 'tools'] as const
@@ -55,7 +55,8 @@ export interface Config {
   outboundEnabled?: boolean
 }
 export const Config = z.object({
-  botToken: z.string().required(true),
+  // botToken 单一来源（2026-09-06）：config 可选（空 → apply 里读 .credentials.yaml refs.TELEGRAM_BOT_TOKEN 兜底）
+  botToken: z.string().default(''),
   ownerChatId: z.number().required(false),
   mainSessionId: z.string().required(false),
   pollTimeoutMs: z.number().default(25000),
@@ -139,6 +140,18 @@ function summarizeBlocks(message: Message | undefined): string {
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-agent-telegram')
+  // botToken 单一来源（2026-09-06 凭据迁移）：config 优先（兼容旧配置）→ .credentials.yaml refs 兜底。
+  // .credentials.yaml 在 DSH_HOME（不入 git），patch config 会被 git 跟踪——凭据迁移到文件更安全。
+  if (!config.botToken) {
+    try {
+      const cred = readFileSync(join(homeDir(), '.credentials.yaml'), 'utf8')
+      const m = cred.match(/^\s*TELEGRAM_BOT_TOKEN:\s*(\S+)/m)
+      if (m && m[1]) {
+        config.botToken = m[1]
+        tgLog('info', 'botToken 来自 .credentials.yaml（config 为空）')
+      }
+    } catch { /* 无凭据文件：保持 config 值 */ }
+  }
   tgLog('info', 'apply (HMR probe)', 'inbound=' + String(config.inboundEnabled) + ' outbound=' + String(config.outboundEnabled))
 
   // ── 共享状态：owner / offset / pending（inbound 用） + outbox（outbound 用） ──
@@ -225,6 +238,78 @@ export function apply(ctx: Context, config: Config): void {
     return firstId
   }
 
+  // ════════════════════════ 文件传输（outbound） ════════════════════════
+
+  const TG_FILE_MAX = 50 * 1024 * 1024 // Telegram Bot API 单文件上传上限 50MB
+
+  /** 按扩展名选 Telegram 发送方法 */
+  function fileMethod(path: string): { method: string; field: string; kind: string } {
+    const ext = path.split('.').pop()?.toLowerCase() ?? ''
+    if (['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext)) return { method: 'sendPhoto', field: 'photo', kind: 'photo' }
+    if (['gif'].includes(ext)) return { method: 'sendAnimation', field: 'animation', kind: 'animation' }
+    if (['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext)) return { method: 'sendVideo', field: 'video', kind: 'video' }
+    if (['mp3', 'm4a', 'ogg', 'wav', 'opus', 'flac'].includes(ext)) return { method: 'sendAudio', field: 'audio', kind: 'audio' }
+    return { method: 'sendDocument', field: 'document', kind: 'document' }
+  }
+
+  /** 发送本地文件（multipart 上传，429 退避重试）；返回 ok/messageId/kind/error */
+  async function sendFile(chatId: number, filePath: string, caption?: string): Promise<{ ok: boolean; messageId?: number; error?: string; kind: string }> {
+    let st: { size: number; isFile(): boolean }
+    try {
+      st = statSync(filePath)
+    } catch {
+      return { ok: false, error: '文件不存在或不可读: ' + filePath, kind: 'document' }
+    }
+    if (!st.isFile()) return { ok: false, error: '不是文件: ' + filePath, kind: 'document' }
+    if (st.size > TG_FILE_MAX) return { ok: false, error: '文件超过 50MB 上限: ' + Math.round(st.size / 1048576) + 'MB', kind: 'document' }
+    const { method, field, kind } = fileMethod(filePath)
+    const filename = basename(filePath)
+    const maxRetries = config.maxRetries ?? 3
+    const retryBackoffMs = config.retryBackoffMs ?? 1500
+    let lastErr = ''
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const buf = readFileSync(filePath)
+        const form = new FormData()
+        form.append(field, new Blob([buf]), filename)
+        form.append('chat_id', String(chatId))
+        if (caption) form.append('caption', caption.slice(0, 1024))
+        const res = (await fetch(API + config.botToken + '/' + method, {
+          method: 'POST',
+          body: form,
+          signal: AbortSignal.timeout(120000),
+        })) as unknown as {
+          ok: boolean
+          status: number
+          json(): Promise<{ ok: boolean; result?: { message_id?: number }; description?: string; parameters?: { retry_after?: number } }>
+        }
+        const json: { ok: boolean; result?: { message_id?: number }; description?: string; parameters?: { retry_after?: number } } =
+          await res.json().catch(() => ({ ok: false, description: '响应非 JSON' }))
+        if (res.ok && json.ok && json.result?.message_id !== undefined) {
+          tgLog('info', 'sendFile 成功', method + ' ' + filename + ' mid=' + json.result.message_id)
+          return { ok: true, messageId: json.result.message_id, kind }
+        }
+        if (json.description?.includes('Too Many Requests')) {
+          const retryAfter = json.parameters?.retry_after ?? 2
+          tgLog('warn', 'sendFile 429', 'attempt=' + attempt + ' retry_after=' + retryAfter)
+          await new Promise((r) => setTimeout(r, retryAfter * 1000))
+          continue
+        }
+        lastErr = json.description ?? ('HTTP ' + res.status)
+        tgLog('warn', 'sendFile 失败', method + ' ' + lastErr)
+        return { ok: false, error: lastErr, kind }
+      } catch (e) {
+        lastErr = String(e)
+        tgLog('warn', 'sendFile 网络错误', 'attempt=' + attempt + ' ' + lastErr)
+      }
+      if (attempt < maxRetries) {
+        const backoff = retryBackoffMs * Math.pow(2, attempt)
+        await new Promise((r) => setTimeout(r, backoff))
+      }
+    }
+    return { ok: false, error: lastErr || '未知错误', kind }
+  }
+
   // ════════════════════════ Inbound：长轮询 + 注入 + 回传 ════════════════════════
   let offset = 0
   let stopped = false
@@ -264,26 +349,71 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // 恢复持久化 pending（哨兵重启不丢回传目标）
+  // 2026-09-02 修复：pending 恢复不得绕过 mainSessionId——若配置了主会话且
+  // saved.sessionId 与之不符（幽灵会话误选残留），以 mainSessionId 为准并丢弃旧 pending。
   try {
     const saved = JSON.parse(readFileSync(pendingFile(), 'utf8')) as { chatId?: number; messageId?: number; sessionId?: string }
     if (typeof saved.chatId === 'number' && typeof saved.messageId === 'number' && typeof saved.sessionId === 'string') {
-      pending = { chatId: saved.chatId, messageId: saved.messageId, sessionId: saved.sessionId }
-      tgLog('info', '恢复 pending', 'chat=' + saved.chatId + ' mid=' + saved.messageId + ' session=' + saved.sessionId)
+      const sessionId = config.mainSessionId !== undefined ? config.mainSessionId : saved.sessionId
+      if (sessionId !== saved.sessionId) {
+        tgLog('warn', 'pending session 与 mainSessionId 不符，改用主会话', 'saved=' + saved.sessionId + ' main=' + sessionId)
+      }
+      pending = { chatId: saved.chatId, messageId: saved.messageId, sessionId }
+      tgLog('info', '恢复 pending', 'chat=' + saved.chatId + ' mid=' + saved.messageId + ' session=' + sessionId)
       startTyping(saved.chatId)
     }
   } catch { /* 无记录或损坏忽略 */ }
 
-  // 目标会话解析：追踪最新活跃主会话（带缓存兜底）
+  // 目标会话解析：追踪「最近收到真实 GUI 用户消息」的主会话。
+  //
+  // 2026-09-03 修复（错投旧会话根因）：
+  //   旧实现按「最后任意事件时间」选目标——telegram 自己注入旧会话 → 旧会话事件变新 →
+  //   下次又选它（自我强化循环）；且 patch 硬编码 mainSessionId 指向 9/2 的 GUI 主会话，
+  //   今天 GUI 切到新会话后失效。
+  //   新实现：只认 source.kind==='user' 的真实 GUI 用户消息（telegram 注入是 plugin 源，
+  //   不参与判定），实时从 session/event 监听更新 lastUserPromptAt，选择最新者。
+  let lastUserPromptAt = 0
+  let lastUserSessionId: string | null = null
+
+  ctx.on('session/event', (session, event) => {
+    const ev = event as { type?: string; data?: { source?: { kind?: string } } }
+    if (ev.type === 'user/message' && ev.data?.source?.kind === 'user') {
+      const t = (event as { time?: number }).time ?? Date.now()
+      if (t >= lastUserPromptAt) {
+        lastUserPromptAt = t
+        lastUserSessionId = session.id
+      }
+    }
+  })
+
   function resolveTargetSessionId(): string | null {
+    // ① 显式 mainSessionId（config 直配，如主人想钉死某会话）
     if (config.mainSessionId !== undefined) return config.mainSessionId
+    // ② 实时监听到的真实用户会话（本进程内最新）
+    if (lastUserSessionId !== null && lastUserPromptAt > 0) {
+      const agentLive = ctx.agents.get(lastUserSessionId as never)
+      if (agentLive !== undefined) return lastUserSessionId
+    }
+    // ③ 兜底：扫全部顶层会话，找最后一条 source.kind==='user' 消息所在会话
     let best: { id: string; time: number } | null = null
     for (const s of ctx.sessions.list()) {
       if ((s.header?.delegationDepth ?? 0) !== 0) continue
       const events = s.events
-      const lastTime = events.length > 0 ? (events[events.length - 1]?.time ?? 0) : 0
-      if (best === null || lastTime > best.time) best = { id: s.id, time: lastTime }
+      for (let i = events.length - 1; i >= 0; i--) {
+        const ev = events[i] as { type?: string; data?: { source?: { kind?: string } }; time?: number }
+        if (ev.type !== 'user/message') continue
+        if (ev.data?.source?.kind !== 'user') continue
+        const t = ev.time ?? 0
+        if (best === null || t > best.time) best = { id: s.id, time: t }
+        break // 每个会话只看最后一条真实用户消息
+      }
     }
-    if (best !== null) { lastGoodSessionId = best.id; return best.id }
+    if (best !== null) {
+      lastUserSessionId = best.id
+      lastUserPromptAt = best.time
+      return best.id
+    }
+    // ④ 最后的兜底：无任何真实用户消息时回退旧缓存
     if (lastGoodSessionId !== null) {
       tgLog('info', '目标会话兜底', 'use cached session=' + lastGoodSessionId)
       return lastGoodSessionId
@@ -592,6 +722,25 @@ export function apply(ctx: Context, config: Config): void {
           outboxPending: outbox.length,
           botPrefix: config.botToken.slice(0, 8),
         }
+      },
+    }))
+
+    ctx.tools.register(defineTool({
+      name: 'telegram_send_file',
+      description: '发送一个本地文件给主人（Telegram 可靠文件传输：自动按扩展名选 sendPhoto/sendAnimation/sendVideo/sendAudio/sendDocument；支持中文路径；单文件上限 50MB；429 退避重试）。用于把 ComfyUI 生图输出/截图/文档/音频等本地文件直发主人。',
+      parameters: {
+        path: { type: 'string', description: '本地文件绝对路径（如 D:\\\\桌面\\\\ComfyUI\\\\output\\\\xxx.png 或 E:/alice/_tmp_review/xxx.png）', required: true },
+        caption: { type: 'string', description: '可选说明文字（≤1024 字符，纯文本）' },
+        chat_id: { type: 'number', description: '目标 chat id（缺省=owner 白名单）' },
+      },
+      output: { schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true }, messageId: { type: 'number' }, kind: { type: 'string' }, error: { type: 'string' } } }, render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '文件已发送 (' + (v.kind ?? 'file') + ')' + (v.messageId !== undefined ? ' msg=' + v.messageId : '') : '文件发送失败：' + (v.error ?? '未知') }] },
+      async execute(args: { path: string; caption?: string; chat_id?: number }) {
+        if (ownerChatId === null) {
+          return { ok: false, error: 'owner 未绑定：请在配置 ownerChatId 或先发一条消息完成绑定', kind: 'document' }
+        }
+        const chatId = args.chat_id ?? ownerChatId
+        logger.info('sendFile chat=' + chatId + ' path=' + args.path)
+        return await sendFile(chatId, args.path, args.caption)
       },
     }))
   }
