@@ -145,9 +145,11 @@ export function apply(ctx: Context, config: Config): void {
   if (!config.botToken) {
     try {
       const cred = readFileSync(join(homeDir(), '.credentials.yaml'), 'utf8')
-      const m = cred.match(/^\s*TELEGRAM_BOT_TOKEN:\s*(\S+)/m)
-      if (m && m[1]) {
-        config.botToken = m[1]
+      // YAML 字符串值可能带引号（"..." 或 '...'）——清洗后才是真实 token（2026-09-07 修复：引号污染导致 404）
+      const m = cred.match(/^\s*TELEGRAM_BOT_TOKEN:\s*(?:"([^"]+)"|'([^']+)'|(\S+))/m)
+      const raw = (m && (m[1] ?? m[2] ?? m[3])) ?? ''
+      if (raw) {
+        config.botToken = raw
         tgLog('info', 'botToken 来自 .credentials.yaml（config 为空）')
       }
     } catch { /* 无凭据文件：保持 config 值 */ }
@@ -313,6 +315,7 @@ export function apply(ctx: Context, config: Config): void {
   // ════════════════════════ Inbound：长轮询 + 注入 + 回传 ════════════════════════
   let offset = 0
   let stopped = false
+  let pollFailCount = 0 // 2026-09-07：getUpdates 连续失败计数（退避防日志风暴）
   let pending: { chatId: number; messageId: number; sessionId?: string } | null = null
   let typingTimer: NodeJS.Timeout | null = null
   let polling = false
@@ -561,9 +564,14 @@ export function apply(ctx: Context, config: Config): void {
       allowed_updates: ['message'],
     }, { timeoutMs: 90000 })
     if (updates === null) {
-      tgLog('warn', 'getUpdates 返回 null（API 异常，含 409 冲突）')
+      // 2026-09-07 修复：失败退避防日志风暴（此前 200ms 死循环每秒刷 warn，日志 17MB）
+      pollFailCount += 1
+      const backoffMs = Math.min(pollFailCount * 2000, 60000)
+      tgLog('warn', 'getUpdates 返回 null（API 异常，含 409 冲突）', 'fail#' + pollFailCount + ' backoff=' + backoffMs + 'ms')
+      await new Promise((r) => setTimeout(r, backoffMs))
       return
     }
+    pollFailCount = 0
     if (updates.length > 0) tgLog('info', 'getUpdates 收到', 'count=' + updates.length)
     for (const u of updates) {
       if (u.update_id < offset) continue
