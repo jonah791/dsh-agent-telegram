@@ -53,6 +53,12 @@ export interface Config {
   inboundEnabled?: boolean
   /** 禁用 outbound 工具（只留 inbound） */
   outboundEnabled?: boolean
+  /** telegram_ask 单题等待超时 ms（缺省 600000=10 分钟） */
+  askTimeoutMs?: number
+  /** 会话不可用期间消息重试投递的总时限 ms（缺省 300000=5 分钟） */
+  retryMaxMs?: number
+  /** telegram_ask 是否启用（缺省 true） */
+  askEnabled?: boolean
 }
 export const Config = z.object({
   // botToken 单一来源（2026-09-06）：config 可选（空 → apply 里读 .credentials.yaml refs.TELEGRAM_BOT_TOKEN 兜底）
@@ -68,6 +74,9 @@ export const Config = z.object({
   outboxPath: z.string().required(false),
   inboundEnabled: z.boolean().default(true),
   outboundEnabled: z.boolean().default(true),
+  askTimeoutMs: z.number().default(600000),
+  retryMaxMs: z.number().default(300000),
+  askEnabled: z.boolean().default(true),
 })
 
 const API = 'https://api.telegram.org/bot'
@@ -322,6 +331,130 @@ export function apply(ctx: Context, config: Config): void {
   const TYPING_TTL_MS = 15000
   let lastGoodSessionId: string | null = null
 
+  // ── 会话不可用重试队列（2026-09-07：重启窗口期 agent 未激活时消息被直接丢弃 →
+  //    入队轮询重试，agent 就绪后自动补投；retryMaxMs 上限防无限占内存） ──
+  interface RetryItem { chatId: number; messageId: number; text: string; deadline: number }
+  const retryQueue: RetryItem[] = []
+  let retryTimer: NodeJS.Timeout | null = null
+
+  // ── telegram_ask：电报提问等待状态机（2026-09-07 新增）
+  //    发问题给 owner → 挂起等待回复 → 把答案作为工具结果返回（不注入会话） ──
+  interface AskItem {
+    id: string
+    question: string
+    header?: string
+    options?: { label: string; description?: string }[]
+    multiSelect: boolean
+  }
+  let activeAsk: {
+    items: AskItem[]
+    index: number
+    answers: { id: string; selected: string[]; custom?: string }[]
+    resolve: (v: { answers: { id: string; selected: string[]; custom?: string }[] }) => void
+    reject: (e: Error) => void
+    questionMsgId: number | null
+    deadline: number
+    timer: NodeJS.Timeout | null
+    chatId: number
+  } | null = null
+
+  function clearRetryTimer(): void {
+    if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null }
+  }
+  function pumpRetryQueue(): void {
+    clearRetryTimer()
+    if (retryQueue.length === 0) return
+    const now = Date.now()
+    // 清掉超时项
+    for (let i = retryQueue.length - 1; i >= 0; i--) {
+      if (retryQueue[i]!.deadline <= now) {
+        tgLog('warn', '重试队列丢弃（超时）', 'text=' + retryQueue[i]!.text.slice(0, 60))
+        retryQueue.splice(i, 1)
+      }
+    }
+    if (retryQueue.length === 0) return
+    const item = retryQueue[0]!
+    const targetId = tryDeliver(item.chatId, item.messageId, item.text)
+    if (targetId !== null) {
+      retryQueue.shift()
+      tgLog('info', '重试队列投递成功', 'session=' + targetId + ' 剩余=' + retryQueue.length)
+    }
+    if (retryQueue.length > 0) retryTimer = setTimeout(pumpRetryQueue, 2000)
+  }
+
+  /** 生成当前提问的展示文本（含已答/剩余） */
+  function askRender(a: NonNullable<typeof activeAsk>): string {
+    const cur = a.items[a.index]!
+    const lines: string[] = []
+    if (cur.header) lines.push('【' + cur.header + '】')
+    lines.push('(' + (a.index + 1) + '/' + a.items.length + ') ' + cur.question)
+    if (cur.options && cur.options.length > 0) {
+      cur.options.forEach((o, i) => {
+        lines.push('  ' + (i + 1) + '. ' + o.label + (o.description ? ' — ' + o.description : ''))
+      })
+      lines.push(cur.multiSelect ? '（可多选：回复 1,3 或 全部）' : '（回复序号选择；或直接输入自定义答案）')
+      if (cur.options.some((o) => o.label.toLowerCase().includes('recommended'))) {
+        lines.push('（推荐项已标注）')
+      }
+    }
+    lines.push('回复 /cancel 取消本次提问')
+    return lines.join('\n')
+  }
+
+  /** 解析主人对当前问题的回复 → answers 推进；返回 null 表示解析失败（让主人重答） */
+  function askConsume(a: NonNullable<typeof activeAsk>, text: string): { answers: { id: string; selected: string[]; custom?: string }[] } | null {
+    const cur = a.items[a.index]!
+    const t = text.trim()
+    const ans: { id: string; selected: string[]; custom?: string } = { id: cur.id, selected: [] }
+    // 序号选择：1 / 1,3 / 1 3 → 选项 index
+    if (cur.options && cur.options.length > 0) {
+      const sel: number[] = []
+      const parts = t.split(/[\s,，、;；]+/).filter(Boolean)
+      let allMatched = true
+      for (const p of parts) {
+        const n = Number(p)
+        if (Number.isInteger(n) && n >= 1 && n <= cur.options.length) {
+          sel.push(n - 1)
+        } else {
+          const li = cur.options.findIndex((o) => o.label === t || o.label.toLowerCase() === t.toLowerCase())
+          if (li >= 0) { sel.push(li); break }
+          allMatched = false
+          break
+        }
+      }
+      if (allMatched && sel.length > 0) {
+        const unique = [...new Set(sel)]
+        if (!cur.multiSelect && unique.length > 1) return null // 单选却给多序号
+        ans.selected = unique.map((i) => cur.options![i]!.label)
+      } else if (t.toLowerCase() === '全部' || t === 'all') {
+        if (cur.multiSelect) {
+          ans.selected = cur.options.map((o) => o.label)
+        } else { return null }
+      } else if (/^\/cancel$/i.test(t)) {
+        return { answers: a.answers.concat([{ id: cur.id, selected: [], custom: '/cancel' }]) }
+      } else {
+        // 自由文本 → custom
+        ans.custom = t
+        ans.selected = []
+      }
+    } else {
+      if (/^\/cancel$/i.test(t)) return { answers: a.answers.concat([{ id: cur.id, selected: [], custom: '/cancel' }]) }
+      ans.custom = t
+      ans.selected = []
+    }
+    return { answers: a.answers.concat([ans]) }
+  }
+
+  /** 收尾：resolve/reject activeAsk + 清 timer */
+  function finishAsk(v: { answers: { id: string; selected: string[]; custom?: string }[] } | Error): void {
+    const a = activeAsk
+    if (a === null) return
+    activeAsk = null
+    if (a.timer !== null) { clearTimeout(a.timer); a.timer = null }
+    if (v instanceof Error) a.reject(v)
+    else a.resolve(v)
+  }
+
   try {
     const saved = JSON.parse(readFileSync(offsetFile(), 'utf8')) as { offset?: number }
     if (typeof saved.offset === 'number' && saved.offset > 0) offset = saved.offset
@@ -421,6 +554,32 @@ export function apply(ctx: Context, config: Config): void {
       tgLog('info', '目标会话兜底', 'use cached session=' + lastGoodSessionId)
       return lastGoodSessionId
     }
+    // ⑤ 重启恢复：从持久化 pending 文件恢复主会话（重启后内存态清零，
+    //    但 telegram-pending.json 记录了上次注入的会话——2026-09-07 修复）
+    try {
+      const saved = JSON.parse(readFileSync(pendingFile(), 'utf8')) as { sessionId?: string; chatId?: number; messageId?: number }
+      if (typeof saved.sessionId === 'string' && saved.sessionId.length > 0) {
+        const agentLive = ctx.agents.get(saved.sessionId as never)
+        if (agentLive !== undefined) {
+          tgLog('info', '目标会话恢复', 'from pending file session=' + saved.sessionId)
+          lastGoodSessionId = saved.sessionId
+          return saved.sessionId
+        }
+        // pending 会话 agent 未激活（会话文件在但 agent 未挂载）——
+        // 不直接返回，继续尝试其他活跃 agent；同时记日志便于诊断
+        tgLog('warn', '目标会话恢复跳过', 'pending session=' + saved.sessionId + ' agent 未激活')
+      }
+    } catch { /* 无记录或损坏忽略 */ }
+    // ⑥ 最终兜底：扫全部活跃 agent，任选一个（重启后 GUI 主会话未激活时，
+    //    仍要保证 telegram 消息能注入——2026-09-07 修复）
+    const liveAgents = ctx.agents.list()
+    if (liveAgents.length > 0) {
+      const pick = liveAgents[0]!
+      const pickId = String(pick.id ?? pick)
+      tgLog('info', '目标会话兜底', 'use live agent session=' + pickId)
+      lastGoodSessionId = pickId
+      return pickId
+    }
     return null
   }
 
@@ -474,6 +633,7 @@ export function apply(ctx: Context, config: Config): void {
     if (chatId !== ownerChatId) return // 非 owner：静默忽略
 
     const trimmed = text.trim()
+
     if (trimmed === '/status') {
       void sendText(chatId, statusText())
       return
@@ -524,16 +684,49 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
 
-    const targetId = resolveTargetSessionId()
+    // ── telegram_ask 提问中：owner 普通消息 = 当前问题答案（不注入会话；命令已在上方优先处理） ──
+    if (activeAsk !== null) {
+      if (activeAsk.chatId !== chatId) return
+      if (/^\/cancel$/i.test(trimmed)) {
+        tgLog('info', 'ask 被 /cancel', 'chat=' + chatId + ' 已答=' + activeAsk.answers.length + '/' + activeAsk.items.length)
+        void sendText(chatId, '已取消提问。')
+        finishAsk(new Error('the user cancelled telegram_ask'))
+        return
+      }
+      const step = askConsume(activeAsk, trimmed)
+      if (step === null) {
+        void sendText(chatId, '无法解析（单选请只回一个序号；或直接输入自定义答案）。\n' + askRender(activeAsk))
+        return
+      }
+      activeAsk.answers = step.answers
+      activeAsk.index += 1
+      if (activeAsk.index >= activeAsk.items.length) {
+        const done = activeAsk.answers
+        tgLog('info', 'ask 全部答完', 'count=' + done.length)
+        finishAsk({ answers: done })
+        return
+      }
+      void sendText(chatId, '收到。\n\n' + askRender(activeAsk))
+      return
+    }
+
+    const targetId = tryDeliver(chatId, messageId, trimmed)
     if (targetId === null) {
-      void sendText(chatId, '当前没有可注入的活跃会话（sessions 为空）')
-      return
+      // 会话不可用：入重试队列（重启窗口期 agent 未激活时防丢消息）
+      const retryMaxMs = config.retryMaxMs ?? 300000
+      retryQueue.push({ chatId, messageId, text: trimmed, deadline: Date.now() + retryMaxMs })
+      tgLog('warn', '会话不可用，入重试队列', 'text=' + trimmed.slice(0, 60) + ' 队列=' + retryQueue.length)
+      void sendText(chatId, '（当前会话尚未就绪，消息已排队，稍后自动送达）')
+      if (retryQueue.length === 1) pumpRetryQueue()
     }
+  }
+
+  /** 解析目标会话并注入主会话。成功返回 sessionId；失败（无可注入会话/agent 未激活）返回 null。 */
+  function tryDeliver(chatId: number, messageId: number, trimmed: string): string | null {
+    const targetId = resolveTargetSessionId()
+    if (targetId === null) return null
     const agent = ctx.agents.get(targetId as never)
-    if (agent === undefined) {
-      void sendText(chatId, '目标会话不可用（' + targetId + '）')
-      return
-    }
+    if (agent === undefined) return null
     tgLog('info', '收到消息', 'chat=' + chatId + ' mid=' + messageId + ' session=' + targetId + ' text=' + trimmed.slice(0, 80))
     pending = { chatId, messageId, sessionId: targetId }
     savePending()
@@ -546,11 +739,13 @@ export function apply(ctx: Context, config: Config): void {
         }),
       )
       tgLog('info', '注入成功', 'chat=' + chatId + ' mid=' + messageId + ' agent=' + String(agent.status))
+      return targetId
     } catch (e) {
       clearPending()
       if (typingTimer !== null) { clearInterval(typingTimer); typingTimer = null }
       tgLog('error', '注入失败', 'chat=' + chatId + ' err=' + String(e))
       void sendText(chatId, '注入失败：' + String(e))
+      return null
     }
   }
 
@@ -753,13 +948,129 @@ export function apply(ctx: Context, config: Config): void {
     }))
   }
 
+  // ════════════════════════ telegram_ask：电报提问工具（2026-09-07 新增） ════════════════════════
+  // 模型侧工具：把问题发到 owner 电报 → 挂起等待回复（inbound 消息作为答案）→
+  // 全部答完返回 answers（不进 GUI 弹窗，主人远程即可作答）。不依赖 outbound 工具集
+  // （inbound 轮询收答案 + sendText 发问题）；HMR 卸载时 reject 挂起调用。
+  if (config.askEnabled !== false) {
+    ctx.tools.register(defineTool({
+      name: 'telegram_ask',
+      description: '通过 Telegram 向主人提问并等待回复（无需 GUI）。需要确认/选择/补充信息时使用——问题会发到主人绑定的 Telegram 频道，主人回复后作为工具结果返回。questions 数组，每项含稳定 id/question/可选 header/options/multi_select；推荐项放 options 首位并标 "(Recommended)"。主人可回序号（单选一个/多选逗号分隔）或直接输入自定义答案；/cancel 取消。注意：一次只应有一个活跃 telegram_ask（并发调用会报错）。',
+      parameters: {
+        questions: {
+          type: 'array',
+          required: true,
+          description: '要问的问题列表（逐题发送，主人逐题作答）。',
+          items: {
+            type: 'object',
+            additionalProperties: true,
+            properties: {
+              id: { type: 'string', required: true, description: '稳定 id，答案里原样回显' },
+              question: { type: 'string', required: true, description: '问题正文' },
+              header: { type: 'string', description: '可选的简短标题（如 Confirm / 选择模式）' },
+              options: {
+                type: 'array',
+                description: '可选选项（主人可回序号选择或输入自定义）',
+                items: {
+                  type: 'object',
+                  additionalProperties: true,
+                  properties: {
+                    label: { type: 'string', required: true, description: '选项标签' },
+                    description: { type: 'string', description: '一句说明' },
+                  },
+                },
+              },
+              multi_select: { type: 'boolean', description: '是否允许多选（默认 false）' },
+            },
+          },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            answers: {
+              type: 'array',
+              required: true,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  id: { type: 'string', required: true },
+                  selected: { type: 'array', required: true, items: { type: 'string' } },
+                  custom: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        render: (_a: unknown, v: any) => [{ type: 'text', text: v.answers.map((x: any) => x.id + '=' + (x.custom ?? x.selected.join(','))).join('; ') }],
+      },
+      async execute(args: { questions: { id: string; question: string; header?: string; options?: { label: string; description?: string }[]; multi_select?: boolean }[] }, exec) {
+        if (ownerChatId === null) {
+          throw new Error('owner 未绑定：请在配置 ownerChatId 或先发一条消息完成绑定')
+        }
+        if (activeAsk !== null) {
+          throw new Error('已有活跃的 telegram_ask 正在等待主人回复——请勿并发提问')
+        }
+        if (!args.questions || args.questions.length === 0) {
+          throw new Error('telegram_ask 需要至少一个问题')
+        }
+        const chatId = ownerChatId
+        const items: AskItem[] = args.questions.map((q) => ({
+          id: q.id,
+          question: q.question,
+          ...q.header !== undefined ? { header: q.header } : {},
+          ...q.options !== undefined ? { options: q.options } : {},
+          multiSelect: q.multi_select ?? false,
+        }))
+        const askTimeoutMs = config.askTimeoutMs ?? 600000
+        tgLog('info', 'telegram_ask 开始', 'questions=' + items.length + ' chat=' + chatId)
+
+        return await new Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>((resolve, reject) => {
+          // 先发第一题；发送失败直接 reject
+          const a: NonNullable<typeof activeAsk> = {
+            items, index: 0, answers: [], resolve, reject,
+            questionMsgId: null, deadline: Date.now() + askTimeoutMs, timer: null, chatId,
+          }
+          activeAsk = a
+          // 整体超时（从头到尾）
+          a.timer = setTimeout(() => {
+            tgLog('warn', 'telegram_ask 超时', 'ms=' + askTimeoutMs)
+            finishAsk(new Error('telegram_ask timed out after ' + askTimeoutMs + 'ms without a full answer'))
+          }, askTimeoutMs)
+          void sendText(chatId, '🔔 主人，我有问题要问：\n\n' + askRender(a)).then((ok) => {
+            if (ok === null) {
+              finishAsk(new Error('telegram_ask 问题发送失败（Telegram API 错误）'))
+            }
+          })
+          // 绑定 exec.signal 取消
+          if (exec.signal !== undefined) {
+            exec.signal.addEventListener('abort', () => {
+              if (activeAsk !== null) finishAsk(new Error('telegram_ask aborted by caller'))
+            }, { once: true })
+          }
+        }).then((v) => ({ answers: v.answers }))
+      },
+    }))
+  }
+
   // ════════════════════════ 生命周期 ════════════════════════
   if (config.outboundEnabled !== false) loadOutbox()
 
-  // HMR/卸载清理：清 typing 心跳 + pending 内存态
+  // HMR/卸载清理：清 typing 心跳 + pending 内存态 + 重试队列 + activeAsk
   ctx.effect(() => () => {
     if (typingTimer !== null) { clearInterval(typingTimer); typingTimer = null }
     pending = null
+    clearRetryTimer()
+    retryQueue.length = 0
+    if (activeAsk !== null) {
+      const a = activeAsk
+      activeAsk = null
+      if (a.timer !== null) { clearTimeout(a.timer); a.timer = null }
+      a.reject(new Error('telegram_ask aborted: plugin reloaded'))
+    }
   }, 'dsh-agent-telegram lifecycle cleanup')
 
   // 启动：inbound 轮询 + outbound flush
