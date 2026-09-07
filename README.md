@@ -10,6 +10,12 @@
 -->
 # dsh-agent-telegram — Telegram 远程连接插件
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-telegram"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 DSH（DeepSeek Harness）插件：通过 Telegram Bot 远程连接主会话——随时随地向 agent 发消息、接收实时回复与任务直播。
 
 ## 功能特性
