@@ -1,4 +1,4 @@
-﻿{
+{
     "name":  "dsh-agent-telegram",
     "version":  "0.3.0",
     "description":  "Telegram 一体化插件：inbound（长轮询收消息注入主会话+回复回传）+ outbound（telegram_send/status 可靠推送+outbox 防丢失）合并单插件",
