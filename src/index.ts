@@ -31,6 +31,7 @@ import type {} from '@deepseek-ai/dsh-session'
 import { appendFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
+import { decideColdAlertPush, type ColdStartAlertPayload } from './cold-alert.ts'
 
 export const name = 'agent-telegram'
 export const inject = ['agents', 'sessions', 'tools'] as const
@@ -59,6 +60,10 @@ export interface Config {
   retryMaxMs?: number
   /** telegram_ask 是否启用（缺省 true） */
   askEnabled?: boolean
+  /** coldstart 告警文件路径（缺省 $DSH_HOME/life-core/coldstart-alert.json） */
+  coldstartAlertPath?: string
+  /** coldstart 告警轮询间隔 ms（缺省 60000） */
+  coldstartWatchIntervalMs?: number
 }
 export const Config = z.object({
   // botToken 单一来源（2026-09-06）：config 可选（空 → apply 里读 .credentials.yaml refs.TELEGRAM_BOT_TOKEN 兜底）
@@ -77,6 +82,8 @@ export const Config = z.object({
   askTimeoutMs: z.number().default(600000),
   retryMaxMs: z.number().default(300000),
   askEnabled: z.boolean().default(true),
+  coldstartAlertPath: z.string().required(false),
+  coldstartWatchIntervalMs: z.number().default(60000),
 })
 
 const API = 'https://api.telegram.org/bot'
@@ -1090,9 +1097,58 @@ export function apply(ctx: Context, config: Config): void {
     const flushTimer = setInterval(() => {
       if (outbox.length > 0) void flushOutbox()
     }, config.flushIntervalMs ?? 60000)
+
+    // coldstart 告警送达（2026-09-11）：life-core 自救失败只落盘告警，插件内部无法通知主人。
+    // 本插件作为通道轮询该文件，发现新告警（mtime 晚于上次已**成功推送**的）即送达。
+    const coldAlertPath = config.coldstartAlertPath ?? join(homeDir(), 'life-core', 'coldstart-alert.json')
+    const coldAlertStatePath = join(homeDir(), 'telegram-coldstart-pushed.json')
+    let lastColdAlertPushedMs = 0
+    try {
+      if (existsSync(coldAlertStatePath)) {
+        const st = JSON.parse(readFileSync(coldAlertStatePath, 'utf8')) as { lastPushedMtimeMs?: number }
+        if (typeof st.lastPushedMtimeMs === 'number') lastColdAlertPushedMs = st.lastPushedMtimeMs
+      }
+    } catch { /* 状态文件损坏 → 从 0 开始（宁可重复推送一次，不可漏报） */ }
+
+    const checkColdAlert = (): void => {
+      try {
+        if (ownerChatId === null) return
+        if (!existsSync(coldAlertPath)) return
+        let mtimeMs = 0
+        try { mtimeMs = statSync(coldAlertPath).mtimeMs } catch { return }
+        if (!(mtimeMs > lastColdAlertPushedMs)) return
+        let payload: ColdStartAlertPayload | null = null
+        try { payload = JSON.parse(readFileSync(coldAlertPath, 'utf8')) as ColdStartAlertPayload } catch { payload = null }
+        const text = decideColdAlertPush({
+          ownerBound: ownerChatId !== null,
+          alertExists: true,
+          alertMtimeMs: mtimeMs,
+          lastPushedMtimeMs: lastColdAlertPushedMs,
+          alert: payload,
+        })
+        if (text === null) return
+        void sendText(ownerChatId, text, true).then((ok) => {
+          // 只有真的送达才记状态——推送失败必须能重试（否则漏报，比重复更严重）
+          if (ok === null) {
+            tgLog('warn', 'coldstart 告警推送失败（未记状态，下轮重试）', 'mtime=' + String(mtimeMs))
+            return
+          }
+          lastColdAlertPushedMs = mtimeMs
+          try {
+            writeFileSync(coldAlertStatePath, JSON.stringify({ lastPushedMtimeMs: mtimeMs, at: new Date().toISOString() }), 'utf8')
+          } catch { /* 状态落盘失败 → 下轮可能重复推送一次，可接受 */ }
+          tgLog('info', 'coldstart 告警已送达主人', 'mtime=' + String(mtimeMs))
+        })
+      } catch (e) {
+        tgLog('warn', 'coldstart 告警检查异常（已吞，不炸 web）', String(e))
+      }
+    }
+    const coldAlertTimer = setInterval(checkColdAlert, config.coldstartWatchIntervalMs ?? 60000)
+
     return () => {
       stopped = true
       clearInterval(flushTimer)
+      clearInterval(coldAlertTimer)
       if (outboxDirty) saveOutbox()
       tgLog('info', 'loop stop')
     }
