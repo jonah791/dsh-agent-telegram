@@ -794,6 +794,13 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   async function loop(): Promise<void> {
+    // 预检试运行实例（dsh-agent-preflight 以 DSH_PREFLIGHT_TRIAL=1 spawn 的完整 web）：
+    // 跳过长轮询——两个实例轮询同一 bot 会 409 冲突，且后者的 getUpdates 可能吞掉主人的消息
+    // （2026-09-13 实测 .watch-web.log 内 409 冲突与预检窗口同行）。插件本身照常加载（组合验证不受影响）。
+    if (process.env.DSH_PREFLIGHT_TRIAL === '1') {
+      tgLog('info', 'DSH_PREFLIGHT_TRIAL=1（预检试运行实例）→ 跳过 getUpdates 长轮询，避免与 live 实例争抢 bot')
+      return
+    }
     while (!stopped) {
       if (!polling) {
         polling = true
