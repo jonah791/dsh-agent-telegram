@@ -33,6 +33,28 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { decideColdAlertPush, type ColdStartAlertPayload } from './cold-alert.ts'
 
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-telegram': { kind: 'dsh-agent-telegram' }
+  }
+}
+
+/**
+ * DSH 0.1.6 适配：`Session.events` 公共属性已移除——同步读取 Session 历史全线弃用
+ * （见 deepseek-harness/.agents/notes/implemented/architecture/
+ * 2026-09-09-deprecate-synchronous-session-event-reads.md）。改用同语义的
+ * `snapshotEvents()`，并保留异常归一：会话未装载时读历史曾抛 TypeError，
+ * 该类异常若从定时器逃逸会杀死宿主 web 进程（2026-09-14 线上事故）。
+ */
+function sessionEvents(session: { snapshotEvents(): readonly unknown[] }): readonly unknown[] {
+  try {
+    const events = session.snapshotEvents()
+    return Array.isArray(events) ? events : []
+  } catch {
+    return []
+  }
+}
+
 export const name = 'agent-telegram'
 export const inject = ['agents', 'sessions', 'tools'] as const
 
@@ -541,7 +563,7 @@ export function apply(ctx: Context, config: Config): void {
     let best: { id: string; time: number } | null = null
     for (const s of ctx.sessions.list()) {
       if ((s.header?.delegationDepth ?? 0) !== 0) continue
-      const events = s.events
+      const events = sessionEvents(s)
       for (let i = events.length - 1; i >= 0; i--) {
         const ev = events[i] as { type?: string; data?: { source?: { kind?: string } }; time?: number }
         if (ev.type !== 'user/message') continue
@@ -656,7 +678,7 @@ export function apply(ctx: Context, config: Config): void {
     if (trimmed === '/sessions') {
       const lines = ctx.sessions.list().map((s) => {
         const dep = s.header?.delegationDepth ?? 0
-        return (dep === 0 ? '*' : ' ') + s.id + ' ev=' + s.events.length
+        return (dep === 0 ? '*' : ' ') + s.id + ' ev=' + sessionEvents(s).length
       })
       void sendText(chatId, '会话列表 (' + lines.length + '，*主会话):\n' + (lines.join('\n') || '（空）'))
       return
@@ -665,8 +687,8 @@ export function apply(ctx: Context, config: Config): void {
       const targetId = resolveTargetSessionId()
       const s = targetId !== null ? ctx.sessions.list().find((x) => x.id === targetId) : undefined
       if (s === undefined) { void sendText(chatId, '无活跃会话'); return }
-      const events = s.events
-      const last = events.length > 0 ? new Date(events[events.length - 1]?.time ?? 0).toISOString() : '-'
+      const events = sessionEvents(s)
+      const last = events.length > 0 ? new Date((events[events.length - 1] as { time?: number } | undefined)?.time ?? 0).toISOString() : '-'
       const msgCount = events.filter((e) => (e as { type?: string }).type === 'user/message' || (e as { type?: string }).type === 'assistant/message').length
       void sendText(chatId, '上下文 ' + targetId + '\nevents=' + events.length + ' msgs=' + msgCount + '\nlast=' + last)
       return
@@ -678,7 +700,7 @@ export function apply(ctx: Context, config: Config): void {
       const s = targetId !== null ? ctx.sessions.list().find((x) => x.id === targetId) : undefined
       if (s === undefined) { void sendText(chatId, '无活跃会话'); return }
       const msgs: string[] = []
-      for (const ev of s.events) {
+      for (const ev of sessionEvents(s)) {
         const type = (ev as { type?: string }).type
         if (type !== 'user/message' && type !== 'assistant/message') continue
         const msg = (ev as { data?: { message?: Message } }).data?.message
@@ -742,7 +764,7 @@ export function apply(ctx: Context, config: Config): void {
       agent.steer(
         createUserMessage({
           content: [{ type: 'text', text: '[telegram] ' + trimmed }],
-          source: { kind: 'plugin', plugin: 'dsh-agent-telegram' },
+          source: { kind: 'dsh-agent-telegram' },
         }),
       )
       tgLog('info', '注入成功', 'chat=' + chatId + ' mid=' + messageId + ' agent=' + String(agent.status))
