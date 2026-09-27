@@ -205,6 +205,7 @@ Telegram Bot API ←──┤ loop(): DSH_PREFLIGHT_TRIAL? 跳过 : pollOnce(get
 - **与本条语义的关系**：本文档对 `s.events` 无任何断言；§4.2 六级回退、§5 失败面、§7 验收表所写的**判决与投递语义**均未被该改动触及 ⇒ **假报**——告警来自 impl 清单的**文件粒度**（同一 `src/index.ts` 被平台适配碰到），不是内容过时。
 - **该改动已构建并 live**：`lib/index.js` mtime `2026-09-20 11:51:21` < web 进程启动 `2026-09-22 12:29:33`，且 `grep -c snapshotEvents lib/index.js` = 2 ⇒ 不存在「线上跑的是未适配旧代码」的隐含风险。
 - **附带事实（未回写）**：该未提交改动在文件前部插入 16 行，使 §4.3 引用的行号整体 +16（inject `:37→:53`、`ctx.on('session/event')` `:521/:594→:537/:610`、`resolveTargetSessionId` `:532→:548`、工具面 `:909/:929/:945/:970→:926/:946/:962/:987`、`ctx.effect` `:1077/:1091→:1093/:1107`）。本文件行号仍锚定 HEAD `254d941`——**该改动落盘后需统一回写**。
+- **2026-09-28 D3 复核（0.1.7 平台适配波次 · 判为假报）**：触发提交 `e31cbe1`「fix(0.1.7): MessageSourceMap.plugin 已移除 ⇒ 生产者改自声明 source kind」（+28/−6）。逐行对读确认两处：新增 `declare module` 的 `MessageSourceMap` 声明、`source` 自声明改写。⚠ **与上一条并非同一个提交**——上一条处理的是 `sessionEvents()` 那次读取通道迁移，本条是 09-23 的**新波次**，本文档此前未覆盖。**§4.2 六级回退、§5 失败面、§7 验收表所写的判决与投递语义均未被触及** ⇒ 不为消警而改内容。复核方式：`git -C self-plugins/dsh-agent-telegram show e31cbe1`。
 
 ## 10 · 未决问题
 
