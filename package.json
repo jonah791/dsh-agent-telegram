@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-telegram",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Telegram 一体化插件：inbound（长轮询收消息注入主会话+回复回传）+ outbound（telegram_send/status 可靠推送+outbox 防丢失）合并单插件",
   "type": "module",
   "main": "lib/index.js",
@@ -31,6 +31,7 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
+    "prepare": "tsc -p tsconfig.json",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test \"tests/*.test.mjs\""

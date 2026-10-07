@@ -32,6 +32,7 @@ import { appendFileSync, existsSync, readFileSync, rmSync, statSync, writeFileSy
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { decideColdAlertPush, type ColdStartAlertPayload } from './cold-alert.ts'
+import { decidePollAlert, decidePollRecovery } from './poll-alert.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -86,6 +87,8 @@ export interface Config {
   coldstartAlertPath?: string
   /** coldstart 告警轮询间隔 ms（缺省 60000） */
   coldstartWatchIntervalMs?: number
+  /** inbound 连续失败达该次数 → 主动告警主人（走 outbound；缺省 30，0=关闭） */
+  pollFailAlertThreshold?: number
 }
 export const Config = z.object({
   // botToken 单一来源（2026-09-06）：config 可选（空 → apply 里读 .credentials.yaml refs.TELEGRAM_BOT_TOKEN 兜底）
@@ -106,6 +109,7 @@ export const Config = z.object({
   askEnabled: z.boolean().default(true),
   coldstartAlertPath: z.string().required(false),
   coldstartWatchIntervalMs: z.number().default(60000),
+  pollFailAlertThreshold: z.number().default(30),
 })
 
 const API = 'https://api.telegram.org/bot'
@@ -203,6 +207,12 @@ export function apply(ctx: Context, config: Config): void {
     }
   } catch { /* 损坏忽略 */ }
 
+  // 诊断（2026-10-07 事故）：最近一次 apiCall 的失败原因。
+  // 事故形状——poll 不传 retry ⇒ apiCall 里所有 lastErr 都不落日志，409 的具体 description 被完全丢弃；
+  // 结果是「收信死了近 2 小时」只能靠外部脚本调 Telegram 才查出根因（webhook 抢占 getUpdates）。
+  // 这里只存最近一次、只用于日志与告警，不参与任何业务判断。
+  let lastApiFailure = ''
+
   // ── Telegram API 原语（共享：poll 用超时 90s，send 用 30s + 重试） ──
   async function apiCall<T>(method: string, params: Record<string, unknown>, opts?: { timeoutMs?: number; retry?: boolean }): Promise<T | null> {
     const timeoutMs = opts?.timeoutMs ?? 30000
@@ -221,7 +231,7 @@ export function apply(ctx: Context, config: Config): void {
           ok: boolean
           status: number
           text(): Promise<string>
-          json(): Promise<{ ok: boolean; result?: T; description?: string; parameters?: { retry_after?: number } }>
+          json(): Promise<{ ok: boolean; result?: T; description?: string; error_code?: number; parameters?: { retry_after?: number } }>
         }
         if (res.ok) {
           const json = await res.json()
@@ -234,14 +244,24 @@ export function apply(ctx: Context, config: Config): void {
               continue
             }
             lastErr = json.description
+            lastApiFailure = method + ' error_code=' + String(json.error_code ?? '?') + ' ' + json.description
             return null
           }
+          lastErr = 'ok=true 但无 result（响应形状异常）'
+          lastApiFailure = method + ' → ' + lastErr
           return null
         }
-        lastErr = 'HTTP ' + res.status
+        // HTTP 非 2xx：Telegram 把**真实原因写在 body 里**（409 冲突 / 401 令牌无效 / 404 方法不存在）。
+        // 原实现只记 status 不读 body（2026-10-07 事故：409 的 "can't use getUpdates method while
+        // webhook is active" 被丢了，收信死近 2 小时查不出根因）。
+        let bodySnippet = ''
+        try { bodySnippet = (await res.text()).slice(0, 300) } catch { /* body 读不出就只留状态码 */ }
+        lastErr = 'HTTP ' + res.status + (bodySnippet ? ' ' + bodySnippet : '')
+        lastApiFailure = method + ' → ' + lastErr
         if (doRetry) tgLog('warn', 'api ' + method + ' HTTP ' + res.status, 'attempt=' + attempt)
       } catch (e) {
         lastErr = String(e)
+        lastApiFailure = method + ' → ' + lastErr
         if (doRetry) tgLog('warn', 'api ' + method + ' 网络错误', 'attempt=' + attempt + ' ' + lastErr)
       }
       if (doRetry && attempt < maxRetries) {
@@ -778,6 +798,23 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  // inbound 断线告警（2026-10-07 事故驱动）：管道 A（收信）坏了，要用管道 B（发信）报警——
+  // 本次 getUpdates 连续失败近 2 小时，而 outbound 全程健康，却没有任何信号到达主人。
+  // 一次故障期只告警一次（pollAlerted 去重），恢复时再报一次；阈值可配（0=关闭）。
+  let pollAlerted = false
+  function maybeAlertPollFailure(): void {
+    const text = decidePollAlert({
+      pollFailCount,
+      threshold: config.pollFailAlertThreshold ?? 30,
+      alreadyAlerted: pollAlerted,
+      ownerBound: ownerChatId !== null,
+      cause: lastApiFailure,
+    })
+    if (text === null || ownerChatId === null) return
+    pollAlerted = true
+    void sendText(ownerChatId, text, true)
+  }
+
   async function pollOnce(): Promise<void> {
     const updates = await apiCall<{
       update_id: number
@@ -791,9 +828,18 @@ export function apply(ctx: Context, config: Config): void {
       // 2026-09-07 修复：失败退避防日志风暴（此前 200ms 死循环每秒刷 warn，日志 17MB）
       pollFailCount += 1
       const backoffMs = Math.min(pollFailCount * 2000, 60000)
-      tgLog('warn', 'getUpdates 返回 null（API 异常，含 409 冲突）', 'fail#' + pollFailCount + ' backoff=' + backoffMs + 'ms')
+      // 2026-10-07：失败必须带**原因**——原来的「API 异常，含 409 冲突」把 webhook 抢占、
+      // 网络超时、令牌失效全糊成一句话，等于没有诊断力（§5.22 五问之「断在哪一段」）。
+      tgLog('warn', 'getUpdates 失败', 'fail#' + pollFailCount + ' backoff=' + backoffMs + 'ms cause=' + (lastApiFailure || '未记录'))
+      maybeAlertPollFailure()
       await new Promise((r) => setTimeout(r, backoffMs))
       return
+    }
+    if (pollAlerted) {
+      const text = decidePollRecovery({ alreadyAlerted: pollAlerted, ownerBound: ownerChatId !== null })
+      pollAlerted = false
+      if (text !== null && ownerChatId !== null) void sendText(ownerChatId, text, true)
+      tgLog('info', '收信恢复（此前已告警）', 'failStreak=' + String(pollFailCount))
     }
     pollFailCount = 0
     if (updates.length > 0) tgLog('info', 'getUpdates 收到', 'count=' + updates.length)
@@ -812,6 +858,39 @@ export function apply(ctx: Context, config: Config): void {
       } catch (e) {
         tgLog('warn', 'handleUpdate 异常（保留 offset 下轮重试）', String(e))
       }
+    }
+  }
+
+  // 启动自检（2026-10-07 安全事件驱动）：**本插件从不设置 webhook**，所以「bot 上有 webhook」
+  // 只可能来自外部（token 外流后被第三方注册，用来把主人的消息转发走）。
+  // 且 webhook 激活时 getUpdates 必然 409 ⇒ inbound 直接死。
+  // 纪律：只检测、只报告——是否删 webhook 归主人裁决（也可能是主人自己接的服务）。
+  async function precheckWebhook(): Promise<void> {
+    if (process.env.DSH_PREFLIGHT_TRIAL === '1') return // 预检试运行实例不重复告警
+    try {
+      const info = await apiCall<{ url?: string; pending_update_count?: number }>('getWebhookInfo', {})
+      if (info === null) {
+        tgLog('warn', '启动自检：getWebhookInfo 失败', lastApiFailure || '未记录')
+        return
+      }
+      const url = info.url ?? ''
+      if (url !== '') {
+        tgLog('error', '启动自检：bot 上存在 webhook（inbound 必然 409）', 'url=' + url + ' pending=' + String(info.pending_update_count ?? 0))
+        if (ownerChatId !== null) {
+          void sendText(
+            ownerChatId,
+            '⚠️ 启动自检：我的电报 bot 上挂着一个 webhook\n\n' + url +
+            '\n\nTelegram 规则：webhook 激活时长轮询必然 409 ⇒ 我收不到您的消息。' +
+            '我从不设置 webhook，所以这是外部设置的（token 可能外流）。\n\n' +
+            '请确认是否是您自己的服务；若不是，建议在 BotFather 轮换 token。',
+            true,
+          )
+        }
+      } else {
+        tgLog('info', '启动自检：无 webhook（inbound 通道干净）')
+      }
+    } catch (e) {
+      tgLog('warn', 'webhook 自检异常（已吞，不炸 web）', String(e))
     }
   }
 
@@ -1120,6 +1199,7 @@ export function apply(ctx: Context, config: Config): void {
       tgLog('info', 'loop start', 'delay=' + String(config.startDelayMs ?? 5000) + 'ms offset=' + offset)
       setTimeout(() => {
         if (stopped) return
+        void precheckWebhook()
         void loop()
       }, config.startDelayMs ?? 5000)
     }

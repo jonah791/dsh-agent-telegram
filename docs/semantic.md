@@ -108,6 +108,18 @@ Telegram Bot API ←──┤ loop(): DSH_PREFLIGHT_TRIAL? 跳过 : pollOnce(get
 | `mtime ≤ lastPushedMtimeMs` | `null` | 同一条告警不重复刷屏 |
 | `alert === null`（解析失败） | **仍推送**（兜底文案） | 宁可文案简略，不可漏报 |
 
+`decidePollAlert(input) → string | null`（`src/poll-alert.ts`）——**收信断了，该不该用发信把这件事喊出去**（两条路径独立，故可用 B 报 A 的故障）：
+
+| 输入状态 | 裁决 | 理由 |
+|---------|------|------|
+| `ownerBound === false` | `null` | 无处可送 |
+| `threshold <= 0` | `null` | 显式关闭告警 |
+| `alreadyAlerted === true` | `null` | **一次故障期只喊一次**（防刷屏；恢复时另报） |
+| `pollFailCount < threshold` | `null` | 未达阈值（瞬态失败不该吵主人） |
+| 以上皆否 | **推送**，文案含失败次数 + `cause` **原文**；`cause` 为空则如实写「未记录」 | 根因可见性是本次事故的核心教训——含糊的告警等于没告警 |
+
+`decidePollRecovery({alreadyAlerted, ownerBound}) → string | null`：**只有告警过才报「已恢复」**——没告过就报平安是纯噪音。
+
 ### 4.3 调用点清单 `[MUST]`
 
 | 调用方 | 调用点（文件:符号 / 行号） | 时机 |
@@ -131,7 +143,7 @@ Telegram Bot API ←──┤ loop(): DSH_PREFLIGHT_TRIAL? 跳过 : pollOnce(get
 - **能力边界 ≠ 沙箱**：owner 白名单是**语义过滤**，不是认证——知道 chat id 就能伪装（Telegram 侧身份由 Bot API 保证）；`telegram_send_file` 能读取本地**任意可读路径**并上传（50MB 上限），故调用者必须自己判断内容是否可外发。
 - **不越界清单**：不写记忆库；不访问未知会话（只对 `resolveTargetSessionId` 的结果注入）；不修改 harness 配置；不在 patch 里存凭据。
 - **失败面**：
-  - `getUpdates` 返回 null（含 409 冲突）→ 指数退避（`pollFailCount*2000`，上限 60s）并记日志（**防 200ms 死循环刷日志**——历史事故：日志涨到 17MB）。
+  - `getUpdates` 失败（返回 null）→ 指数退避（`pollFailCount*2000`，上限 60s）+ 记日志**含原因**（`lastApiFailure`：`error_code` + `description`，HTTP 非 2xx 时读 body）+ 达 `pollFailAlertThreshold` 时用 outbound 告警主人（**防 200ms 死循环刷日志**——历史事故：日志涨到 17MB；**2026-10-07 加固**：失败必带原因、断线必告警）。
   - 目标会话不可达 → 入 retryQueue + 回执「消息已排队」；超 `retryMaxMs` **丢弃并记 warn**。
   - 发送失败 → 入 outbox（**放行 + 落盘**），`attempts ≥ 5` 弃置并记 warn。
   - `outbox` 载入/落盘失败 → warn 不抛。
@@ -184,6 +196,16 @@ Telegram Bot API ←──┤ loop(): DSH_PREFLIGHT_TRIAL? 跳过 : pollOnce(get
   - 数据面：`telegram-offset.json` 可安全删除（重新从最新 update 开始，**可能重复处理最近一条**）；`telegram-outbox.json` 删除 = 丢弃待发消息（**不可逆**，删前先读它内容）；`telegram-owner.json` 删除 = 下次收到消息时**任何人可重新绑定**（安全敏感，勿随意删）。
 
 ## 9 · 实践修订记录
+
+**2026-10-07 收信静默事故：webhook 抢占导致 getUpdates 全灭（安全事件）**
+
+- **症状**：主人报「电报发不出去」。实为 **inbound 收不到**——`getUpdates` 连续失败近 2 小时（本地 06:29→08:18，`fail#122+`），**零告警**；同期 outbound 全程健康。
+- **根因（实测，非推断）**：`getWebhookInfo` 返回 `url=https://tele.goldenherd.com/tg/webhook/<botid>`；`getUpdates` 返回 **HTTP 409**「Conflict: can't use getUpdates method while webhook is active」。**本插件代码里没有 setWebhook/deleteWebhook** ⇒ webhook 只可能来自**外部** ⇒ 判定 **token 外流**（主人确认非其所设）。处置链：`deleteWebhook`（保留 pending）→ `getUpdates` 立刻恢复 200；主人在 BotFather **revoke token**（旧值 `getMe` 变 **401**）；新值写入 `.credentials.yaml` + 重启（**值在 `apply` 时读入内存，改文件不热生效**——否则 401 会持续）。
+- **语义被修正**（原文档不足）：
+  - §5 原写「返回 null（含 409 冲突）」——**这句话本身就是缺陷**：它把 409 webhook 抢占 / 401 令牌失效 / 429 限流 / 网络超时**糊成一句**。实证：revoke 后实际是 **401**，日志却仍写「含 409 冲突」，**日志在说谎**。现改为「失败必带 `error_code` + `description`；HTTP 非 2xx 时**读 body**」。
+  - 新增 §4.2 两个纯函数契约（`decidePollAlert` / `decidePollRecovery`）。
+- **结构性教训**：**收信与发信是两条独立路径** ⇒ 管道 A 的故障本可用管道 B 通报，此前**没接这条线**，于是「通道死了 2 小时，而主人在另一端干等」。启动自检 webhook 之所以成立，是因为「**本插件从不设 webhook**」是一条**不变量**——把不变量写成自检，异常即指纹。
+- **未决（本次未闭环）**：token 的**外流路径未查明**。本地含明文的落点：记忆库 6 处（溯源到 2026-08-16 会话 checkpoint「token 主人显式提供，config 落盘」）、10 个 checkpoint 的 `memjson`、`watch/cordis.patch.yml`（存的是**第三个、更陈旧的** token，从未跟随轮换）——**均未入 git**，故泄露发生在别处。
 
 **2026-09-14 补课：本插件此前无语义文档（可维护性工程）**
 

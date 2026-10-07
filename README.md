@@ -44,6 +44,14 @@
 
 **coldstart 告警送达**：本插件周期性检查 `$DSH_HOME/life-core/coldstart-alert.json`（`coldstartWatchIntervalMs`），把「我不在」的冷启动自救失败告警推给主人。**判定逻辑是纯函数**（`src/cold-alert.ts`，零 IO、时间由调用方注入），已成功推送的告警按 mtime 去重（不会重复轰炸）。
 
+**收信断线自证与告警**（2026-10-07 收信静默 2 小时事故加固）——收信（`getUpdates`）与发信（`sendMessage`）是**两条独立路径**，所以收信死了要用发信把这件事喊出去：
+
+1. **失败必带原因**：`getUpdates` 失败日志含 `error_code` + `description`；HTTP 非 2xx 时**读 body**（Telegram 把真实原因写在 body 里）。此前只写一句「API 异常，含 409 冲突」，把 409 webhook 抢占 / 401 令牌失效 / 网络超时**糊成一句**，实测让 401 被误读成 409。
+2. **断线主动告警**：连续失败达 `pollFailAlertThreshold` 就用电报通知主人（一次故障期只报一次，恢复时再报一次）。
+3. **启动自检 webhook**：本插件**从不设置 webhook**，所以一旦 `getWebhookInfo` 发现 webhook —— 只可能是**外部**挂上去的（token 外流），且 webhook 激活时长轮询**必然 409**。发现即落 error 日志 + 告警主人；**只报告不擅自删除**（也可能是主人自己接的服务，擅自删就是对抗）。
+
+判定逻辑是纯函数（`src/poll-alert.ts`），配 11 条离线用例，其中一条用**本次事故的真实 409 原文**做回归夹具。
+
 ## 快速开始
 
 **1) 装依赖**（自研插件家园 `self-plugins/`，在目标 profile 的 `package.json` 加 link 依赖）：
@@ -96,7 +104,7 @@ cd self-plugins/dsh-agent-telegram && npm install && npm run build && npm test
 
 | 项 | 默认 | 说明 |
 |----|------|------|
-| `botToken` | `''`（空则读 `DSH_HOME/.credentials.yaml` 的 `refs.TELEGRAM_BOT_TOKEN`） | Bot（@BotFather 创建）。**单一来源**：优先 config，其次凭据文件——**不要写进 README/源码** |
+| `botToken` | `''`（空则读 `DSH_HOME/.credentials.yaml` 的 `refs.TELEGRAM_BOT_TOKEN`） | Bot（@BotFather 创建）。**单一来源**：优先 config，其次凭据文件——**不要写进 README/源码**。⚠ **轮换 token 后必须重启**：值在 `apply` 时读入内存，改文件不会热生效（2026-10-07 实测：revoke 后进程仍持旧值 → 401） |
 | `ownerChatId` | 未设 | 主人 chat id（发放白名单）。未设时靠「首条消息自动绑定」，绑定结果落 `telegram-owner.json` |
 | `mainSessionId` | 未设 | 主会话 id（可选；缺省时自动追踪最近真实 GUI 用户消息的会话） |
 | `pollTimeoutMs` | `25000` | 长轮询 getUpdates 超时 |
@@ -113,6 +121,7 @@ cd self-plugins/dsh-agent-telegram && npm install && npm run build && npm test
 | `askEnabled` | `true` | 是否注册 `telegram_ask` |
 | `coldstartAlertPath` | 未设（回退 `$DSH_HOME/life-core/coldstart-alert.json`） | coldstart 告警文件路径（**只读**输入） |
 | `coldstartWatchIntervalMs` | `60000` | 告警文件检查间隔 |
+| `pollFailAlertThreshold` | `30` | 收信（`getUpdates`）连续失败达该次数 → 主动用电报告警主人（`0` = 关闭）。退避递增到 60s 后，约 15 分钟触发；一次故障期只报一次，恢复时再报一次 |
 
 ## 落盘与自证（出问题时先看这里）
 
