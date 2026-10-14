@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-telegram"><img src="https://img.shields.io/badge/version-0.3.1-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-10%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-21%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：把 agent 接到 Telegram 上——主人随时发消息（实时 steer，不必等整轮结束）、随时收直播与文件、随时回答 agent 的提问；发送失败的消息进 outbox **不丢**。
